@@ -1,0 +1,4 @@
+This config relied on provisioning all machines using ansible from vagrant
+
+This currently is failing during the gluster section
+

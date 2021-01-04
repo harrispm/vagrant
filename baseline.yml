@@ -1,0 +1,235 @@
+#################################################
+# DO Community Playbooks: Docker
+#################################################
+# most from https://www.digitalocean.com/community/tutorials/how-to-create-a-kubernetes-cluster-using-kubeadm-on-ubuntu-18-04
+# To install it use: ansible-galaxy collection install community.general
+
+---
+
+- hosts: group
+  gather_facts: true
+  become: true
+  #  vars_files:
+  # - vars/default.yml
+  vars_files:
+    - secrets.yml 
+  vars:
+    key: "key"
+
+
+##############################################
+#  Set basic configuration    
+#   - Hostname
+#
+##################################
+  
+  tasks:
+    - name: Print FQDN
+      debug: msg="ansible_fqdn is {{ ansible_fqdn }} inventory hostname is {{ inventory_hostname }} ip is {{ ansible_host }}"
+
+    - name: add the hostname to the hosts file
+      lineinfile: dest=/etc/hosts
+              regexp="^127\.0\.0\.1(.*)"
+              line="127.0.0.1{{'\t'}}{{ inventory_hostname }}{{'\t'}} {{ inventory_hostname }}.dev.pnclocal.com localhost.localdomain localhost"
+              state=present
+              backrefs=yes
+
+    - name: set the search domain
+      lineinfile: dest=/etc/systemd/resolved.conf
+              line="Domains=dev.pnclocal.com"
+              state=present
+
+     ##########################################
+    # Create Directory structure #
+    ##########################################          
+
+    - name: Ensure needed directories exist.
+      file: "path={{ item }} state=directory mode=0777"
+      with_items:
+        - /gluster
+        - /gluster/brick
+        - /gluster/fs
+        - /data
+        - /data/nfs
+        - /data/gluster
+
+
+   ################################################
+    # Install the usual software
+    ################################################
+
+    - name: install mc
+      apt: name=mc state=latest update-cache=yes force_apt_get=yes
+    
+    - name: install git
+      apt: name=git state=latest force_apt_get=yes
+    
+    ######  Setup autonfs   #########
+
+    - name: install autonfs
+      apt: name=autofs state=latest update_cache=yes force_apt_get=yes
+
+    - name: modify master map
+      lineinfile:
+        dest: /etc/auto.master
+        line: '/data/nfs   /etc/auto.nfs'
+
+    - name: create auto.nfs
+      file:
+        path: "/etc/auto.nfs"
+        state: touch
+    
+    - name: auto.nfs
+      lineinfile:
+        dest: /etc/auto.nfs
+        line: 'Baxter -fstype=nfs4	192.168.5.12:/'    
+
+    - name: reload autofs
+      service:
+        name: autofs
+        state: reloaded
+
+    - name: restart autofs
+      service:
+        name: autofs
+        state: restarted
+
+    ######################################
+    #  Install Docker
+    ######################################
+
+    - name: Install aptitude using apt
+      apt: name=aptitude state=latest update_cache=yes force_apt_get=yes
+
+    - name: Install required system packages
+      apt: name={{ item }} state=latest update_cache=yes
+      loop: [ 'apt-transport-https', 'ca-certificates', 'curl', 'software-properties-common', 'python3-pip', 'virtualenv', 'python3-setuptools']
+
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu bionic stable
+        state: present
+
+    - name: Update apt and install docker-ce
+      apt: update_cache=yes name=docker-ce state=latest
+
+    - name: Install Docker Module for Python
+      pip:
+        name: docker
+
+    - name: kill swap
+      command: swapoff -a
+
+    - name : fix fstab
+      command: sed "-i.bak" '/swap.img/d' /etc/fstab 
+
+    - name: let traveler run docker
+      command: usermod -aG docker traveler   
+ #####################################
+  #### Configure GlusterFS  ###########
+  #####################################
+
+    - name: Install GlusterFS
+      apt: name=glusterfs-server state=latest update_cache=yes force_apt_get=yes
+
+    - name: Enable service glusterfs
+      service:
+        name: glusterd
+        enabled: yes
+
+    - name: start glusterfs service
+      service:
+        name: glusterd
+        state: started
+    - debug: var=hostvars['gluster2']['ansible_default_ipv4']['address']
+
+    - name: Create a trusted storage pool
+      gluster.gluster.gluster_peer:
+        state: present
+        nodes: 
+         - 192.168.5.26
+         - 192.168.5.27
+      when: "inventory_hostname == 'gluster1'"
+
+    - name: Configure Gluster volume.
+      gluster.gluster.gluster_volume:
+        state: present
+        name: "brick1"
+        bricks: "/gluster/brick"
+        rebalance: yes
+        cluster: 
+         - 192.168.5.26
+         - 192.168.5.27
+        force: true
+      when: "inventory_hostname == 'gluster1'"
+      run_once: true
+
+    - name: start gluster volume
+      gluster.gluster.gluster_volume:
+        state: started
+        name: brick1
+   
+    - name: Mount the gluster volume
+      mount: 
+         path: /data/gluster
+         src: "{{ inventory_hostname }}:/brick1"
+         fstype: glusterfs
+         state: mounted
+      
+
+   #############################################
+    #  Create the swarm
+    ############################################
+
+- hosts: swarm_manager   
+  become: true 
+
+    
+  tasks:
+    - name: Init swarm
+      community.general.docker_swarm:
+        advertise_addr: "192.168.5.25"
+        state: present
+      register: result
+      
+  
+    - debug: 
+        var: result.swarm_facts.JoinTokens.Worker
+
+
+    - name: "Add K8S Token and Hash to dummy host"
+      add_host:
+         name:   "token_holder"
+         token_be:  "{{ result.swarm_facts.JoinTokens.Worker }}"
+         set_fact: token_fact="{{ result.swarm_facts.JoinTokens.Worker }}"
+  
+    - debug: msg="The token is {{ hostvars['token_holder']['token_be'] }}"
+
+       
+- hosts: swarm_worker   
+  become: true 
+  vars:
+      tokenbt: ""
+  tasks:      
+ 
+    - name: Add nodes
+      community.general.docker_swarm:
+        state: join
+        advertise_addr: '192.168.5.26'
+        join_token: "{{ hostvars['token_holder']['token_be'] }}"
+        remote_addrs: '192.168.5.25'
+      when: "inventory_hostname == 'gluster2'"   
+
+    - name: Add nodes
+      community.general.docker_swarm:
+        state: join
+        advertise_addr: '192.168.5.26'
+        join_token: "{{ hostvars['token_holder']['token_be'] }}"
+        remote_addrs: '192.168.5.25'
+      when: "inventory_hostname == 'gluster3'"     
+ 
